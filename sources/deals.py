@@ -3,15 +3,11 @@ import time
 
 import requests
 
+from utils.config import NSE_BASE_URL, NSE_BULK_DEALS_URL, NSE_BLOCK_DEALS_URL
+
 logger = logging.getLogger(__name__)
 
-NSE_HOME = "https://www.nseindia.com"
-NSE_BULK_DEALS_URL = (
-    "https://www.nseindia.com/api/snapshot-capital-market-largedeal?index=bulk_deals"
-)
-NSE_BLOCK_DEALS_URL = (
-    "https://www.nseindia.com/api/snapshot-capital-market-largedeal?index=block_deals"
-)
+NSE_HOME = NSE_BASE_URL
 
 HEADERS = {
     "User-Agent": (

@@ -1,23 +1,40 @@
 import logging
 import re
+import time
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote_plus
 
 import feedparser
 import requests
 
+from utils.config import RBI_PRESS_RSS_URL, RBI_NOTIFICATIONS_RSS_URL
+from utils.config import SEBI_RSS_URL as _SEBI_RSS_URL
+
 logger = logging.getLogger(__name__)
 
 _HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; agentmesh/1.0)"}
 
-RBI_RSS_URLS = [
-    "https://www.rbi.org.in/pressreleases_rss.xml",
-    "https://www.rbi.org.in/notifications_rss.xml",
-]
-SEBI_RSS_URL = "https://www.sebi.gov.in/sebirss.xml"
+RBI_RSS_URLS = [RBI_PRESS_RSS_URL, RBI_NOTIFICATIONS_RSS_URL]
+SEBI_RSS_URL = _SEBI_RSS_URL
 
 
 def _strip_html(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text or "").strip()
+
+
+def _is_recent(entry, max_days: int = 7) -> bool:
+    """Return True if entry was published within the last max_days days."""
+    try:
+        if hasattr(entry, "published_parsed") and entry.published_parsed:
+            pub_dt = datetime.fromtimestamp(
+                time.mktime(entry.published_parsed), tz=timezone.utc
+            )
+            cutoff = datetime.now(tz=timezone.utc) - timedelta(days=max_days)
+            return pub_dt >= cutoff
+    except Exception:
+        pass
+    return True  # if we can't parse date, include it (fail open)
+
 
 
 def _is_actionable_sebi_item(title: str) -> bool:
@@ -52,28 +69,36 @@ def fetch_google_news(query: str) -> list[dict]:
     Returns [] on any failure.
     """
     try:
+        after_date = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
         url = (
             f"https://news.google.com/rss/search"
-            f"?q={quote_plus(query)}&hl=en-IN&gl=IN&ceid=IN:en"
+            f"?q={quote_plus(query)}"
+            f"+after:{after_date}"
+            f"&hl=en-IN&gl=IN&ceid=IN:en"
         )
         resp = requests.get(url, headers=_HEADERS, timeout=15)
         resp.raise_for_status()
         feed = feedparser.parse(resp.content)
-        entries = feed.entries[:10]
+        total = len(feed.entries)
+        entries = [e for e in feed.entries if _is_recent(e, max_days=7)][:10]
         results = []
         for e in entries:
             source = ""
             if hasattr(e, "source") and hasattr(e.source, "title"):
                 source = e.source.title
 
+            url = e.get("link", "")
             results.append({
                 "title": e.get("title", ""),
                 "source": source,
                 "published": e.get("published", ""),
-                "url": e.get("link", ""),
+                "url": url,
                 "summary": _strip_html(e.get("summary", "")),
             })
-        logger.info("fetch_google_news(%r): fetched %d entries", query, len(results))
+        logger.info(
+            "fetch_google_news(%r): %d recent entries (filtered from %d total)",
+            query, len(results), total,
+        )
         return results
     except Exception as exc:
         logger.error("fetch_google_news failed: %s: %s", type(exc).__name__, exc)
@@ -91,11 +116,15 @@ def fetch_rbi_rss() -> list[dict]:
         seen_urls: set[str] = set()
         combined: list[dict] = []
 
+        total = 0
         for rss_url in RBI_RSS_URLS:
             resp = requests.get(rss_url, headers=_HEADERS, timeout=15)
             resp.raise_for_status()
             feed = feedparser.parse(resp.content)
+            total += len(feed.entries)
             for e in feed.entries:
+                if not _is_recent(e, max_days=3):
+                    continue
                 url = e.get("link", "")
                 if url in seen_urls:
                     continue
@@ -109,7 +138,10 @@ def fetch_rbi_rss() -> list[dict]:
 
         combined.sort(key=lambda x: x["published"], reverse=True)
         results = combined[:15]
-        logger.info("fetch_rbi_rss: fetched %d entries", len(results))
+        logger.info(
+            "fetch_rbi_rss: %d recent entries (filtered from %d total)",
+            len(results), total,
+        )
         return results
     except Exception as exc:
         logger.error("fetch_rbi_rss failed: %s: %s", type(exc).__name__, exc)
@@ -127,10 +159,13 @@ def fetch_sebi_rss() -> list[dict]:
         resp.raise_for_status()
         feed = feedparser.parse(resp.content)
         all_entries = feed.entries
-        logger.info("fetch_sebi_rss: fetched %d raw entries", len(all_entries))
+        total = len(all_entries)
+        logger.info("fetch_sebi_rss: fetched %d raw entries", total)
 
         results = []
         for e in all_entries:
+            if not _is_recent(e, max_days=3):
+                continue
             title = e.get("title", "")
             if not _is_actionable_sebi_item(title):
                 continue
@@ -143,7 +178,10 @@ def fetch_sebi_rss() -> list[dict]:
             if len(results) == 10:
                 break
 
-        logger.info("fetch_sebi_rss: %d entries after filter", len(results))
+        logger.info(
+            "fetch_sebi_rss: %d entries after filter (from %d total)",
+            len(results), total,
+        )
         return results
     except Exception as exc:
         logger.error("fetch_sebi_rss failed: %s: %s", type(exc).__name__, exc)
@@ -159,17 +197,18 @@ if __name__ == "__main__":
     print("\n--- Google News: NSE India market ---")
     news = fetch_google_news("NSE India stock market")
     print(f"Total: {len(news)}")
-    for n in news[:3]:
-        print(f"  {n['title']} — {n.get('source', '')}")
+    for n in news[:5]:
+        print(f"  [{n.get('published', 'no date')}] {n['title']} — {n.get('source', '')}")
+        print(f"    URL: {n['url']}")
 
     print("\n--- RBI ---")
     rbi = fetch_rbi_rss()
     print(f"Total: {len(rbi)}")
-    for r in rbi[:3]:
-        print(f"  {r['title']}")
+    for r in rbi[:5]:
+        print(f"  [{r.get('published', 'no date')}] {r['title']}")
 
     print("\n--- SEBI (filtered) ---")
     sebi = fetch_sebi_rss()
     print(f"Total after filter: {len(sebi)}")
-    for s in sebi[:3]:
-        print(f"  {s['title']}")
+    for s in sebi[:5]:
+        print(f"  [{s.get('published', 'no date')}] {s['title']}")

@@ -4,12 +4,11 @@ from typing import Any
 
 import requests
 
+from utils.config import NSE_BASE_URL, NSE_ANNOUNCEMENTS_URL
+
 logger = logging.getLogger(__name__)
 
-NSE_HOME = "https://www.nseindia.com"
-NSE_ANNOUNCEMENTS_URL = (
-    "https://www.nseindia.com/api/corporate-announcements?index=equities"
-)
+NSE_HOME = NSE_BASE_URL
 
 HEADERS = {
     "User-Agent": (

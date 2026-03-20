@@ -28,4 +28,5 @@ dependencies = [
     "python-dotenv>=1.2.2",
     "python-telegram-bot>=22.7",
     "tavily-python>=0.7.23",
+    "yfinance>=1.2.0",
 ]

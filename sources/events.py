@@ -4,10 +4,11 @@ import datetime
 
 import requests
 
+from utils.config import NSE_BASE_URL, NSE_EVENT_CALENDAR_URL
+
 logger = logging.getLogger(__name__)
 
-NSE_HOME = "https://www.nseindia.com"
-NSE_EVENT_CALENDAR_URL = "https://www.nseindia.com/api/event-calendar"
+NSE_HOME = NSE_BASE_URL
 
 HEADERS = {
     "User-Agent": (

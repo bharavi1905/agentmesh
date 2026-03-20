@@ -7,6 +7,9 @@ from sources.nse import fetch_nse_announcements
 from sources.deals import fetch_bulk_deals, fetch_block_deals
 from sources.news_rss import fetch_google_news, fetch_rbi_rss, fetch_sebi_rss
 from sources.events import fetch_event_calendar
+from sources.fii_dii import fetch_fii_dii_flows
+from sources.price import fetch_stock_context
+from utils.market_calendar import is_market_open_today
 from delivery.telegram_bot import send_telegram_alert
 from agents.subagents.scorer import scorer_subagent
 
@@ -14,36 +17,28 @@ from agents.subagents.scorer import scorer_subagent
 # Orchestrator prompt
 # ----------------------------------------------------------------------
 
-ORCHESTRATOR_PROMPT = """CRITICAL: You run exactly ONE scan cycle. After scoring and
-optionally alerting, STOP IMMEDIATELY. Do not loop, do not verify,
-do not re-scan.
+ORCHESTRATOR_PROMPT = """You are a stock market alert system for India.
 
-You are the agentmesh orchestrator — an Indian
-stock market alert system. You run ONE scan per invocation. Do NOT repeat.
+CRITICAL: You run exactly ONE scan cycle. After scoring and optionally
+alerting, STOP IMMEDIATELY. Do not loop, do not verify, do not re-scan.
 
-STRICT RULES:
-- Call each subagent EXACTLY ONCE. Never call the same subagent twice.
-- If a subagent returns an empty list [], that is NORMAL — accept it and move on.
-- Call opportunity-scorer EXACTLY ONCE with ALL collected events combined.
-- After scoring, either send one alert or do nothing. Then STOP.
-- Do NOT scan again after scoring. Do NOT verify results. Just STOP.
-
-YOUR SINGLE RUN SEQUENCE:
+Each scan run — do this exactly once in order:
 1. write_todos: ["scan sources", "score events", "alert or stop"]
-2. Call ALL 4 data subagents via task() simultaneously — ONE call each:
+2. Call ALL 5 subagents simultaneously via task() — ONE call each:
    corporate-action-agent, insider-activity-agent,
-   sector-catalyst-agent, earnings-beat-agent
-3. Combine all results into one list. If all are empty, mark todo done and STOP.
-4. Call opportunity-scorer ONCE with the combined event list.
+   sector-catalyst-agent, earnings-beat-agent, macro-context-agent
+3. Combine all results. If all data is empty, mark todos done and STOP.
+4. Call opportunity-scorer EXACTLY ONCE with ALL collected events
+   plus the FII/DII context from macro-context-agent.
 5. Before alerting, read /memories/seen_events.txt.
-   Skip any event whose ticker+event_type combination already appears.
-   After alerting, append ticker|event_type to /memories/seen_events.txt
-   on a new line.
+   Skip any event whose ticker+event_type already appears there.
+   After alerting, append ticker|event_type to /memories/seen_events.txt.
 
-   If any event scores >= 7, call send_telegram_alert with this format:
+   For each event scoring >= 7, call send_telegram_alert with this format:
    🚨 ALERT — [High/Medium] Confidence
 
    Stock:          [TICKER.NS]
+   Price:          [price_context summary line from scorer]
    Event:          [one line description]
    Impact Score:   [X]/10
    Urgency:        [act_today / this_week / monitor]
@@ -51,14 +46,20 @@ YOUR SINGLE RUN SEQUENCE:
 
    Reasoning: [2 sentences]
    Analogy:   [comparable past event and outcome]
+   FII Today: [fii_context one line from macro-context-agent]
 
    Source: [url]
 
-TERMINATION RULE: The moment send_telegram_alert returns 'sent' OR
+STRICT RULES:
+- Call each subagent EXACTLY ONCE. Never call the same subagent twice.
+- If a subagent returns an empty list or {}, that is NORMAL — accept it.
+- Call opportunity-scorer EXACTLY ONCE.
+- IMPORTANT: Do NOT write any files. Return results as JSON in text only.
+
+TERMINATION RULE: The moment all send_telegram_alert calls complete OR
 you determine no events score >= 7, your job is 100% complete.
 Write your final todo as completed and output your final response.
-Do NOT make any further tool calls after this point.
-The scan is finished. Stop immediately.
+Do NOT make any further tool calls after this point. Stop immediately.
 """
 
 # ----------------------------------------------------------------------
@@ -126,6 +127,25 @@ Return JSON: ticker, reported_eps, estimated_eps, surprise_pct, beat_or_miss."""
     "model": "openai:gpt-4.1-mini",
 }
 
+macro_context_subagent = {
+    "name": "macro-context-agent",
+    "description": (
+        "Fetches today's FII and DII institutional flow data. "
+        "Always call this — it provides confidence context for scoring."
+    ),
+    "system_prompt": """Fetch today's FII/DII flows using fetch_fii_dii_flows().
+Return a brief JSON:
+{
+  "fii_net_cr": <float>,
+  "dii_net_cr": <float>,
+  "sentiment": "bullish|bearish|neutral",
+  "context": "<one sentence for scorer>"
+}
+Call fetch_fii_dii_flows() EXACTLY ONCE. Return the result immediately.""",
+    "tools": [fetch_fii_dii_flows],
+    "model": "openai:gpt-4.1-mini",
+}
+
 # ----------------------------------------------------------------------
 # Backend — cross-run deduplication via CompositeBackend + StoreBackend
 # ----------------------------------------------------------------------
@@ -153,6 +173,7 @@ agent = create_deep_agent(
         insider_activity_subagent,
         sector_catalyst_subagent,
         earnings_beat_subagent,
+        macro_context_subagent,
         scorer_subagent,
     ],
     backend=make_backend,
@@ -169,6 +190,11 @@ agent = create_deep_agent(
 def run_scan():
     import logging
     logger = logging.getLogger(__name__)
+
+    if not is_market_open_today():
+        logger.info("Market is closed today — skipping scan")
+        return
+
     try:
         result = agent.stream(
             {"messages": [{"role": "user", "content": (
