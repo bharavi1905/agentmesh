@@ -13,6 +13,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "apscheduler" },
+    { name = "beautifulsoup4" },
     { name = "deepagents" },
     { name = "duckduckgo-search" },
     { name = "feedparser" },
@@ -33,6 +34,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "apscheduler", specifier = ">=3.11.2" },
+    { name = "beautifulsoup4", specifier = ">=4.14.3" },
     { name = "deepagents", specifier = ">=0.4.11" },
     { name = "duckduckgo-search", specifier = ">=8.1.1" },
     { name = "feedparser", specifier = ">=6.0.12" },

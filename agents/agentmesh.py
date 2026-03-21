@@ -3,6 +3,7 @@ from deepagents.backends import CompositeBackend, StateBackend, StoreBackend
 from langgraph.store.memory import InMemoryStore
 from langgraph.checkpoint.memory import MemorySaver
 
+from utils.config import NSE_BULK_DEALS_PAGE, NSE_BLOCK_DEALS_PAGE
 from sources.nse import fetch_nse_announcements
 from sources.deals import fetch_bulk_deals, fetch_block_deals
 from sources.news_rss import fetch_google_news, fetch_rbi_rss, fetch_sebi_rss
@@ -10,6 +11,7 @@ from sources.events import fetch_event_calendar
 from sources.fii_dii import fetch_fii_dii_flows
 from sources.price import fetch_stock_context
 from utils.market_calendar import is_market_open_today
+from utils.enrichment import prefetch_enrichment
 from delivery.telegram_bot import send_telegram_alert
 from agents.subagents.scorer import scorer_subagent
 
@@ -23,37 +25,60 @@ CRITICAL: You run exactly ONE scan cycle. After scoring and optionally
 alerting, STOP IMMEDIATELY. Do not loop, do not verify, do not re-scan.
 
 Each scan run — do this exactly once in order:
-1. write_todos: ["scan sources", "score events", "alert or stop"]
+1. write_todos: ["scan sources", "prefetch enrichment", "score events", "alert or stop"]
 2. Call ALL 5 subagents simultaneously via task() — ONE call each:
    corporate-action-agent, insider-activity-agent,
    sector-catalyst-agent, earnings-beat-agent, macro-context-agent
 3. Combine all results. If all data is empty, mark todos done and STOP.
-4. Call opportunity-scorer EXACTLY ONCE with ALL collected events
-   plus the FII/DII context from macro-context-agent.
-5. Before alerting, read /memories/seen_events.txt.
+4. Extract all candidate tickers from the collected events (any event
+   that looks like it could score >= 5). Call prefetch_enrichment()
+   ONCE with the full list of tickers. This fetches price and
+   fundamentals for all candidates in parallel.
+5. Call opportunity-scorer ONCE with ALL events (no enrichment data).
+   This is BATCH SCREENING MODE — gets raw scores quickly.
+
+   Then for each event with raw_score >= 6 from the batch screen,
+   call opportunity-scorer again INDIVIDUALLY — one task() call per
+   event — passing that single event PLUS its enrichment data from
+   prefetch_enrichment (price_context + fundamentals for that ticker)
+   PLUS the FII/DII context. This is SINGLE EVENT MODE.
+
+   Only send alerts for events that score >= 7 after all modifiers
+   in the individual scoring call.
+6. Before alerting, read /memories/seen_events.txt.
    Skip any event whose ticker+event_type already appears there.
    After alerting, append ticker|event_type to /memories/seen_events.txt.
 
    For each event scoring >= 7, call send_telegram_alert with this format:
    🚨 ALERT — [High/Medium] Confidence
 
-   Stock:          [TICKER.NS]
-   Price:          [price_context summary line from scorer]
-   Event:          [one line description]
-   Impact Score:   [X]/10
-   Urgency:        [act_today / this_week / monitor]
-   Expected Move:  [+X% to +Y%]
+   <b>Stock:</b>          [affected_ticker]
+   <b>Price:</b>          [price_context — if empty or 'Price data unavailable', show: 'Price data unavailable — verify on NSE']
+   <b>Event:</b>          [one line description]
+   <b>Impact Score:</b>   [impact_score]/10 (raw [raw_score][", FII [fii_adjustment shown as e.g. -1 or +1]" if non-zero][", fundamentals [fund_adjustment]" if non-zero][", no adjustments" if both zero])
+   <b>Urgency:</b>        [act_today / this_week / monitor]
+   <b>Expected Move:</b>  [expected_move_pct]
 
-   Reasoning: [2 sentences]
-   Analogy:   [comparable past event and outcome]
-   FII Today: [fii_context one line from macro-context-agent]
+   <b>Reasoning:</b> [reasoning]
+   <b>Analogy:</b>   [historical_analogy]
+   <b>FII Today:</b> [fii_context]
 
-   Source: [url]
+   [fundamentals_narrative — include exactly as returned by scorer, with emoji and HTML bold tags intact. Omit entirely if empty string.]
+
+   <b>Source:</b>  <a href="[url]">[display_text]</a>
+   where display_text is determined by the url:
+   - 'View article' if url contains 'news.google.com'
+   - 'NSE bulk deals' if url contains 'bulk-deals'
+   - 'NSE block deals' if url contains 'block-deals'
+   - 'NSE announcements' if url contains 'corporate-announcements'
+   - the full url otherwise
+   <b>Verify:</b>  [screener_url — omit this line entirely if screener_url is empty]
 
 STRICT RULES:
 - Call each subagent EXACTLY ONCE. Never call the same subagent twice.
 - If a subagent returns an empty list or {}, that is NORMAL — accept it.
-- Call opportunity-scorer EXACTLY ONCE.
+- Call opportunity-scorer once for batch screening, then once per
+  candidate event (raw_score >= 6) for individual complete scoring.
 - IMPORTANT: Do NOT write any files. Return results as JSON in text only.
 
 TERMINATION RULE: The moment all send_telegram_alert calls complete OR
@@ -83,7 +108,13 @@ or re-fetch.
 
 IMPORTANT: Do NOT write any files. Do NOT use write_file or any
 filesystem tools. Return your results as a JSON list in your text
-response only.""",
+response only.
+
+Return only confirmed NSE-listed ticker symbols.
+Examples of correct symbols: TEXRAIL (not TEXMACO), SHREECEM (not SHREE),
+RELIANCE, BEL, UNOMINDA.
+If unsure of the exact NSE symbol, use ticker: 'UNKNOWN'.
+Never guess — wrong tickers waste the entire enrichment pipeline.""",
     "tools": [fetch_nse_announcements],
     "model": "openai:gpt-4.1-mini",
 }
@@ -94,9 +125,19 @@ insider_activity_subagent = {
         "Fetches NSE bulk deals and block deals. Use when scanning for "
         "promoter buying, institutional accumulation, or large insider trades."
     ),
-    "system_prompt": """You scan NSE bulk deals and block deals for insider signals.
+    "system_prompt": f"""You scan NSE bulk deals and block deals for insider signals.
 Focus on: promoter increases >1%, institutional buying >5cr, promoter selling (bearish).
-Return JSON list: ticker, deal_type, buyer_seller, quantity, value_cr, signal (bullish/bearish).""",
+Return JSON list: ticker, deal_type, buyer_seller, quantity, value_cr, signal (bullish/bearish), source_url.
+
+For bulk deals use source_url: '{NSE_BULK_DEALS_PAGE}'
+For block deals use source_url: '{NSE_BLOCK_DEALS_PAGE}'
+Always include the correct source_url in your JSON output.
+
+Return only confirmed NSE-listed ticker symbols.
+Examples of correct symbols: TEXRAIL (not TEXMACO), SHREECEM (not SHREE),
+RELIANCE, BEL, UNOMINDA.
+If unsure of the exact NSE symbol, use ticker: 'UNKNOWN'.
+Never guess — wrong tickers waste the entire enrichment pipeline.""",
     "tools": [fetch_bulk_deals, fetch_block_deals],
     "model": "openai:gpt-4.1-mini",
 }
@@ -109,7 +150,17 @@ sector_catalyst_subagent = {
     ),
     "system_prompt": """You scan news for sector-level catalysts affecting NSE-listed stocks.
 Focus on: defence contracts, railway orders, infra tenders, PLI approvals, capex announcements.
-For each event return: affected_tickers (list), sector, catalyst_summary, estimated_impact.""",
+For each event return: affected_tickers (list), sector, catalyst_summary, estimated_impact.
+
+IMPORTANT: Call fetch_google_news() a maximum of 3 times with DIFFERENT specific queries.
+If a query returns 0 results, do NOT retry with a rephrased version of the same query.
+Accept 0 results and move on. Return whatever you found.
+
+Return only confirmed NSE-listed ticker symbols.
+Examples of correct symbols: TEXRAIL (not TEXMACO), SHREECEM (not SHREE),
+RELIANCE, BEL, UNOMINDA.
+If unsure of the exact NSE symbol, use ticker: 'UNKNOWN'.
+Never guess — wrong tickers waste the entire enrichment pipeline.""",
     "tools": [fetch_google_news, fetch_rbi_rss, fetch_sebi_rss],
     "model": "openai:gpt-4.1-mini",
 }
@@ -122,7 +173,13 @@ earnings_beat_subagent = {
     ),
     "system_prompt": """You scan the NSE results calendar and identify earnings surprises.
 A beat is significant if actual > estimate by >10%. A miss if actual < estimate by >10%.
-Return JSON: ticker, reported_eps, estimated_eps, surprise_pct, beat_or_miss.""",
+Return JSON: ticker, reported_eps, estimated_eps, surprise_pct, beat_or_miss.
+
+Return only confirmed NSE-listed ticker symbols.
+Examples of correct symbols: TEXRAIL (not TEXMACO), SHREECEM (not SHREE),
+RELIANCE, BEL, UNOMINDA.
+If unsure of the exact NSE symbol, use ticker: 'UNKNOWN'.
+Never guess — wrong tickers waste the entire enrichment pipeline.""",
     "tools": [fetch_event_calendar, fetch_google_news, fetch_rbi_rss],
     "model": "openai:gpt-4.1-mini",
 }
@@ -167,7 +224,7 @@ def make_backend(runtime):
 agent = create_deep_agent(
     model="openai:gpt-5-mini",
     system_prompt=ORCHESTRATOR_PROMPT,
-    tools=[fetch_nse_announcements, send_telegram_alert],
+    tools=[fetch_nse_announcements, prefetch_enrichment, send_telegram_alert],
     subagents=[
         corporate_action_subagent,
         insider_activity_subagent,
@@ -191,9 +248,9 @@ def run_scan():
     import logging
     logger = logging.getLogger(__name__)
 
-    if not is_market_open_today():
-        logger.info("Market is closed today — skipping scan")
-        return
+    # if not is_market_open_today():
+    #     logger.info("Market is closed today — skipping scan")
+    #     return
 
     try:
         result = agent.stream(

@@ -1,5 +1,7 @@
 import asyncio
+import html as html_module
 import logging
+import re
 
 from telegram import Bot
 from telegram.error import TelegramError
@@ -8,10 +10,49 @@ from utils import config
 
 logger = logging.getLogger(__name__)
 
+_ALLOWED_TAGS = re.compile(
+    r'(</?b>|</?i>|</?u>|</?s>|</?code>|</?pre>|<a\s[^>]*>|</a>)',
+    re.IGNORECASE,
+)
+
+
+def _sanitise_telegram_html(message: str) -> str:
+    """Sanitise message for Telegram HTML parse mode.
+
+    - Replaces -- with em dash
+    - Preserves allowed tags: <b> <i> <u> <s> <code> <pre> <a>
+    - Escapes & < > in all text content (handles L&T, P/E <20, etc.)
+    - Auto-closes any unclosed allowed tags
+    """
+    message = message.replace("--", "—")
+
+    parts = _ALLOWED_TAGS.split(message)
+    result = []
+    for part in parts:
+        if _ALLOWED_TAGS.fullmatch(part):
+            result.append(part)
+        else:
+            result.append(html_module.escape(part, quote=False))
+
+    sanitised = "".join(result)
+
+    for tag in ["b", "i", "u", "s", "code", "pre"]:
+        opens = len(re.findall(f"<{tag}>", sanitised, re.IGNORECASE))
+        closes = len(re.findall(f"</{tag}>", sanitised, re.IGNORECASE))
+        if opens > closes:
+            sanitised += f"</{tag}>" * (opens - closes)
+
+    return sanitised
+
 
 async def _send(bot_token: str, chat_id: str, message: str) -> None:
     async with Bot(token=bot_token) as bot:
-        await bot.send_message(chat_id=chat_id, text=message)
+        await bot.send_message(
+            chat_id=chat_id,
+            text=message,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
 
 
 def send_telegram_alert(message: str) -> str:
@@ -23,6 +64,8 @@ def send_telegram_alert(message: str) -> str:
     Returns 'sent' on success, 'dry_run' in dry-run mode.
     Raises on unrecoverable error.
     """
+    message = _sanitise_telegram_html(message)
+
     if config.DRY_RUN:
         logger.info("[DRY RUN] Alert suppressed — would have sent:\n%s", message)
         print(f"\n[DRY RUN] Alert suppressed — would have sent:\n{message}\n")

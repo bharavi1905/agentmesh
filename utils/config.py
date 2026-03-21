@@ -56,5 +56,11 @@ RBI_PRESS_RSS_URL         = "https://www.rbi.org.in/pressreleases_rss.xml"
 RBI_NOTIFICATIONS_RSS_URL = "https://www.rbi.org.in/notifications_rss.xml"
 SEBI_RSS_URL              = "https://www.sebi.gov.in/sebirss.xml"
 
+# ─── NSE equity list ────────────────────────────────────
+NSE_EQUITY_LIST_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
+
+# ─── Screener.in ────────────────────────────────────────
+SCREENER_BASE = "https://www.screener.in"
+
 # ─── Telegram ───────────────────────────────────────────
 TELEGRAM_API_BASE = "https://api.telegram.org"
