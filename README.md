@@ -17,6 +17,9 @@ agentmesh runs a mesh of specialised AI agents on a schedule during market hours
 - Earnings surprises — beats or misses vs analyst estimates
 - RBI/SEBI policy announcements that could affect specific sectors
 - FII/DII institutional flow — net buy/sell sentiment across the market
+- Screener.in fundamentals — ROCE, ROE, revenue growth, D/E, promoter holding, P/E for every alerted stock
+- NSE EQUITY_L.csv validation — all tickers validated against 2000+ NSE-listed symbols before processing
+- Two-pass scoring — batch pre-filter then individual deep scoring per candidate event
 
 **Score calibration:**
 - FII/DII flows from the macro-context agent act as a sentiment modifier — bearish FII days reduce all scores by 1 point
@@ -57,13 +60,20 @@ The orchestrator delegates to five data-collection subagents in parallel, passes
 | Subagent | Data Source | Purpose |
 |---|---|---|
 | corporate-action-agent | NSE announcements API | M&A, buybacks, demergers |
-| insider-activity-agent | NSE bulk + block deals | Institutional and promoter buying |
-| sector-catalyst-agent | Google News RSS | Policy, contracts, sector news |
+| insider-activity-agent | NSE bulk + block deals | Promoter/institutional buying |
+| sector-catalyst-agent | Google News RSS | Defence contracts, railway orders, PLI |
 | earnings-beat-agent | NSE event calendar + Google News | Results, earnings surprises |
 | macro-context-agent | NSE FII/DII API | Institutional flow sentiment |
-| opportunity-scorer | All of the above + yfinance | Scores, ranks, enriches with price |
+| opportunity-scorer | All above + yfinance + Screener.in | Two-pass scoring + narratives |
 
 Built on [Deep Agents](https://github.com/langchain-ai/deepagents) — a higher-level harness on top of LangGraph. The orchestrator uses `gpt-5-mini` for reliable agentic stop behaviour. All data-collection subagents use `gpt-4.1-mini` (cheap, single-step tool calls).
+
+**Two-pass scoring:**
+1. Batch pre-filter — all events scored quickly to identify candidates >= 6
+2. Individual deep scoring — each candidate scored separately with full enrichment: live price, 52W range, market cap, and 5-dimension business quality narrative (ROCE, ROE, growth, D/E, promoter holding, P/E)
+
+**Ticker validation:**
+All tickers from subagents are validated against NSE's official EQUITY_L.csv (2000+ symbols, cached 7 days). Invalid, hallucinated, or generic tickers (PSU, INFRA, METAL etc.) are silently discarded before any enrichment calls.
 
 ---
 
@@ -81,6 +91,8 @@ Built on [Deep Agents](https://github.com/langchain-ai/deepagents) — a higher-
 | Google News RSS | Market news, sector developments, company news | Per subagent invocation |
 | RBI RSS | Press releases and notifications | Per subagent invocation |
 | SEBI RSS | Circulars, policy changes (enforcement noise filtered) | Per subagent invocation |
+| Screener.in | Business quality fundamentals per stock | Per alert, at scoring time |
+| NSE EQUITY_L.csv | Complete list of 2000+ NSE-listed symbols | Cached 7 days, auto-refreshed |
 
 All NSE endpoints require a browser-like `requests.Session` with cookies — handled internally.
 
@@ -180,28 +192,33 @@ agentmesh/
 ├── main.py                    ← entry point, starts APScheduler
 │
 ├── agents/
-│   ├── agentmesh.py           ← create_deep_agent() call, all subagent wiring
+│   ├── agentmesh.py           ← orchestrator, 5 subagents, two-pass scoring
 │   └── subagents/
-│       └── scorer.py          ← opportunity-scorer subagent dict + test harness
+│       └── scorer.py          ← two-pass scorer with Business Quality narratives
 │
 ├── sources/
-│   ├── nse.py                 ← NSE corporate announcements poller
+│   ├── nse.py                 ← NSE corporate announcements
 │   ├── deals.py               ← NSE bulk deals + block deals
-│   ├── news_rss.py            ← Google News RSS, RBI RSS, SEBI RSS
-│   ├── events.py              ← NSE results/earnings calendar
+│   ├── news_rss.py            ← Google News, RBI, SEBI RSS (recency filtered)
+│   ├── events.py              ← NSE earnings/results calendar
 │   ├── fii_dii.py             ← NSE FII/DII institutional flow data
-│   └── price.py               ← yfinance live price, 52W range, market cap
+│   ├── price.py               ← yfinance live price, 52W range, market cap
+│   └── fundamentals.py        ← Screener.in scraper + smart slug resolver
 │
 ├── delivery/
-│   └── telegram_bot.py        ← send_telegram_alert tool function
+│   └── telegram_bot.py        ← HTML-formatted Telegram alerts with sanitiser
 │
 ├── utils/
-│   ├── config.py              ← loads .env, exposes settings
-│   ├── logger.py              ← logging setup
-│   └── market_calendar.py     ← NSE trading holiday master for 2026
+│   ├── config.py              ← all API endpoints centralised
+│   ├── enrichment.py          ← parallel prefetch coordinator (price + fundamentals)
+│   ├── market_calendar.py     ← NSE holiday awareness (20 holidays for 2026)
+│   └── nse_symbols.py         ← NSE equity list validator (EQUITY_L.csv)
+│
+├── data/
+│   └── nse_equity.csv         ← cached NSE symbol list (auto-refreshed, gitignored)
 │
 └── tests/
-    └── test_integration.py    ← end-to-end integration tests
+    └── test_integration.py
 ```
 
 ---
@@ -213,22 +230,31 @@ Alerts follow a fixed structure so they're scannable at a glance:
 ```
 🚨 ALERT — High Confidence
 
-Stock:          UNOMINDA.NS
-Price:          ₹1067.0 (+2.65% today) | 52W: ₹767.6–₹1382.0 | 22.8% from 52W high | Mkt Cap: ₹61610 Cr
-Event:          Block deal purchase by promoter group (1,410,000 shares at ₹1100 each)
-Impact Score:   8/10
+Stock:          BEL
+Price:          ₹426.1 (-1.09% today) | 52W: ₹256.2–₹473.45 | 10.0% from 52W high | Mkt Cap: ₹311470 Cr
+Event:          BEL Bags ₹1,011 Crore Orders; shares gained 1.46%
+Impact Score:   8/10  (raw 8, FII -1, fundamentals +1)
 Urgency:        act_today
-Expected Move:  +5% to +10%
+Expected Move:  5-10%
 
-Reasoning: Large block purchase of ₹155.1 crore by promoter group signals
-strong confidence in the stock. The size and promoter involvement imply a
-bullish catalyst notwithstanding FII selling.
-Analogy: Similar to when promoter buying in Minda Industries in 2022 led
-to a 12% rally in weeks.
+Reasoning: BEL won ₹1,011 Crore defence orders — a material contract that
+adds to near-term revenue and backlog. Heavy FII selling today reduces
+immediate confidence (FII adj -1) though strong fundamentals warrant
+positive bias (+1). Watch order execution details for confirmation.
+Analogy:   Comparable to past large order wins by defence PSUs that drove
+multi-week re-ratings once execution clarity emerged.
 FII Today: FII net sold ₹5,518 Cr today — institutional selling reduces
 confidence in bullish alerts
 
-Source: https://www.nseindia.com/market-data/block-deals
+── Business Quality ──
+- Growth: 16% revenue CAGR (3yr) — Steady mid-teens growth for a defence electronics leader
+- Profitability: ROCE 38.9%, ROE 29.2% — Very strong; well above cost of capital
+- Financial Health: D/E 0.00 — Zero debt; balance sheet can support large contract execution without financial strain
+- Promoter Conviction: 51.14% promoter holding — Majority state ownership provides stable long-term stewardship
+- Valuation: P/E 52.2x — Rich but justified by high returns; limited margin for disappointment
+
+Source:  View article
+Verify:  https://www.screener.in/company/BEL/consolidated/
 ```
 
 Only events scoring **7/10 or above** trigger an alert. The scorer filters out noise so you only see high-conviction signals.
@@ -246,7 +272,20 @@ Only events scoring **7/10 or above** trigger an alert. The scorer filters out n
 
 **FII modifier:** bearish FII day (net sell >₹500 Cr) reduces all scores by 1 point.
 
+**Fundamentals modifier:** strong business (ROCE >15%, growth >15%, promoter >50%) → +1 to score. Weak business (ROCE <8%, growth <8%, promoter <35%) → -1 to score. Both modifiers can stack with FII modifier.
+
 **Holiday modifier:** `act_today` urgency changes to `this_week` on NSE holidays.
+
+**Transparent scoring:** every alert shows the full modifier breakdown, e.g. `8/10 (raw 8, FII -1, fundamentals +1)` so you know exactly why a score changed.
+
+---
+
+## Known limitations
+
+- **Source URL display** — Google News alert source URLs are long redirect URLs. They work when tapped but display as "View article" to keep the alert readable. A cleaner solution is planned.
+- **Memory resets on restart** — deduplication uses InMemoryStore which resets when the process restarts. Production deployment on Raspberry Pi will use file-based persistence.
+- **yfinance rate limiting** — Yahoo Finance may rate-limit on very high-frequency scans. The system degrades gracefully — price shows as "unavailable" rather than breaking the alert.
+- **Screener.in rate limiting** — fetching fundamentals for >10 stocks per scan can trigger 429 responses. Handled with 500ms stagger and exponential backoff retry.
 
 ---
 
